@@ -16,6 +16,16 @@ Module: `github.com/AbdelrahmanAmr2205/pace` · Go 1.26
 **This project exists partly so the owner learns Go. Do not write the interesting
 parts for him.** Speed is not the goal; a codebase he understands line by line is.
 
+**Calibrate to his actual level.** He has written HTTP handlers and table-driven tests
+in Go before, through university work and Boot.dev. Do not explain `func`, `:=`,
+slices, or what a test table is. What is genuinely new here is that **he owns the
+product**: every previous project handed him the requirements one step at a time, and
+this is the first application he is building to actually use. So the support that
+helps is design-level — package boundaries, where logic belongs, idiomatic error
+handling, trade-offs between two workable schemas — plus honest pushback on feature
+and scope decisions. Treat his product choices as decisions to be stress-tested, not
+instructions to be executed silently.
+
 ### Claude writes
 
 Structure and wiring: package layout, `go.mod`, `main`, routing, middleware, template
@@ -46,9 +56,11 @@ and how to run just those tests. Do **not** fill in the body unless he explicitl
 **Tests are the spec.** Write them first, make sure they fail for the right reason,
 and hand them over. Never weaken a test to make an implementation pass.
 
-**First of a kind is a worked example.** For a new pattern — the first HTTP handler,
-the first repository method, the first table-driven test — write one complete,
-idiomatic version end to end and explain it. Then hand over the rest of that kind.
+**First of a kind is a worked example — only for patterns that are actually new to
+him.** A repository method over `database/sql`, a migration runner, template
+composition, the timer's start/stop flow: write one complete idiomatic version and
+explain it, then hand over the rest of that kind. Plain HTTP handlers and table-driven
+tests do not need this treatment; hand those over directly.
 
 **Explain Go-specific choices as they are made**: why an interface here, why a value
 receiver, why `errors.Is` over a type switch, why this belongs in its own package.
@@ -68,6 +80,11 @@ These are decided. Reopen them via `docs/decisions.md`, not mid-task.
   activity's target must not rewrite history.
 - **`import _ "time/tzdata"`** must stay in the binary. The image is `FROM scratch`
   with no `/usr/share/zoneinfo`, and the day boundary depends on IANA timezones.
+- **Hijri dates are display-only.** Never stored, never a key, never a query filter.
+  `day` is always a Gregorian `YYYY-MM-DD`.
+- **At most one timer runs at a time**, enforced by the single-row `active_timer`
+  table. Elapsed time is always derived from `started_at` server-side, never counted
+  on the client.
 - **Publish containers to `127.0.0.1` only.** Docker writes its own iptables rules and
   a plainly published port can reach the internet regardless of the cloud firewall.
 - **No JavaScript, no CSS framework, no web framework, no ORM** in v1. Stdlib
@@ -77,12 +94,18 @@ These are decided. Reopen them via `docs/decisions.md`, not mid-task.
 
 ## Scope discipline
 
-v1 has no projects, priorities, task descriptions, subtasks, reminders, streaks, or
-analytics. If a request implies one, say so and ask rather than quietly adding it.
-Fields get added back the first time they are genuinely missed, not in anticipation.
+v1 has no priorities, task descriptions, subtasks, separate due-vs-scheduled dates,
+recurring tasks, weekly views, reminders, notifications, countdown timers, streaks or
+analytics. See `docs/decisions.md` §5 for the full list and the test for whether a new
+request earns its way in (structural things early, scalar fields when missed). If a
+request implies something on the out-list, say so and ask rather than quietly adding it.
 
-The feature that matters most is **speed of logging**. If a change makes recording
-25 minutes slower, it is a regression even if it adds something.
+**Habits are not an entity.** They are activities, grouped by area and rendered with
+`display_style='compact'`. Do not propose a third top-level type.
+
+The feature that matters most is **speed of logging**. Free numeric entry is the
+primary input; shortcut buttons are optional extras. If a change makes recording an
+amount slower, it is a regression even if it adds something.
 
 ---
 

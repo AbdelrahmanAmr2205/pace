@@ -186,13 +186,27 @@ Design rules that are not negotiable:
 
 ```sql
 -- Ordinary tasks. Deliberately minimal; see §5.
-CREATE TABLE tasks (
-    id          TEXT PRIMARY KEY,          -- UUID, generated server-side
-    title       TEXT NOT NULL,
-    due_date    TEXT,                      -- local date 'YYYY-MM-DD', nullable
-    done_at     TEXT,                      -- UTC RFC3339; NULL = not done
+-- User-defined life areas: Health, Religion, Study, ... The organising axis for
+-- both tasks and activities, and what keeps the Today screen from becoming a wall.
+CREATE TABLE areas (
+    id          TEXT PRIMARY KEY,
+    name        TEXT NOT NULL,
+    color       TEXT,                      -- for section headers; presentation only
+    sort_order  INTEGER NOT NULL DEFAULT 0,
+    archived_at TEXT,
     created_at  TEXT NOT NULL,
     updated_at  TEXT NOT NULL
+);
+
+CREATE TABLE tasks (
+    id            TEXT PRIMARY KEY,        -- UUID, generated server-side
+    title         TEXT NOT NULL,
+    area_id       TEXT REFERENCES areas(id),
+    scheduled_for TEXT,                    -- local 'YYYY-MM-DD'; drives the Today screen
+    done_at       TEXT,                    -- UTC RFC3339; NULL = not done
+    duration_min  INTEGER,                 -- optional; how long it actually took
+    created_at    TEXT NOT NULL,
+    updated_at    TEXT NOT NULL
 );
 
 -- A reusable activity definition.
@@ -203,7 +217,10 @@ CREATE TABLE activities (
     unit_kind      TEXT NOT NULL,          -- 'time' | 'quantity'  (drives display only)
     minimum_target INTEGER NOT NULL,       -- current target, in base units
     schedule       TEXT NOT NULL,          -- weekday bitmask or 'daily'
-    quick_amounts  TEXT,                   -- e.g. '25,10' → renders +25m / +10m buttons
+    area_id        TEXT REFERENCES areas(id),
+    display_style  TEXT NOT NULL DEFAULT 'card',  -- 'card' | 'compact'; see §5
+    quick_amounts  TEXT,                   -- OPTIONAL '25,10' → extra +25 / +10 buttons
+                                           -- alongside the free-entry field. Often NULL.
     sort_order     INTEGER NOT NULL DEFAULT 0,
     archived_at    TEXT,
     created_at     TEXT NOT NULL,
@@ -236,11 +253,53 @@ CREATE INDEX idx_progress_day          ON progress_entries (day);
 
 -- Single-row settings table.
 CREATE TABLE settings (
-    id            INTEGER PRIMARY KEY CHECK (id = 1),
-    timezone      TEXT NOT NULL,           -- IANA name
-    day_starts_at TEXT NOT NULL DEFAULT '04:00'
+    id                INTEGER PRIMARY KEY CHECK (id = 1),
+    timezone          TEXT NOT NULL,       -- IANA name
+    day_starts_at     TEXT NOT NULL DEFAULT '04:00',
+    week_starts_on    INTEGER NOT NULL DEFAULT 6,  -- 0=Sun .. 6=Sat
+    hijri_offset_days INTEGER NOT NULL DEFAULT 0   -- -1 / 0 / +1, display only
+);
+
+-- At most one timer runs at a time; the row exists only while it is running.
+-- Elapsed time is derived from started_at on stop, so closing the browser,
+-- switching devices or a phone killing the tab cannot lose it.
+CREATE TABLE active_timer (
+    id          INTEGER PRIMARY KEY CHECK (id = 1),
+    task_id     TEXT REFERENCES tasks(id),
+    activity_id TEXT REFERENCES activities(id),
+    started_at  TEXT NOT NULL,             -- UTC RFC3339
+    CHECK ((task_id IS NULL) <> (activity_id IS NULL))
 );
 ```
+
+### Habits are not a new entity
+
+A habit is already a scalable activity. "Five prayers in the mosque" is an activity
+with `unit='prayers'` and `minimum_target=5`; zikr is an activity with a repetition
+count; "one Boot.dev lesson a day" is an activity with `minimum_target=1`. Adding a
+third top-level entity alongside Task and Activity would duplicate the CRUD, the
+rollups, the history and the Today rendering, and would leave a permanent "which
+bucket does this go in?" question at the moment of capture — which is exactly when
+friction is most expensive.
+
+**The real problem is clutter, and clutter is a presentation problem.** It is solved
+by two cheap things:
+
+- `areas` — the Today screen groups by area, and a finished section collapses to a
+  single line (`Religion ✓ 9/9`).
+- `activities.display_style` — `'compact'` renders a one-line checklist row instead of
+  a full card. Small targets and routine items use it. It is a display hint and
+  nothing else; no logic branches on it.
+
+Whether a prayer set is one activity with a target of 5 or five separate activities
+each with a target of 1 is **runtime configuration, not schema** — both work today,
+and the second gives per-prayer history at the cost of five rows. Decide it when
+creating the activities, and change it freely afterwards.
+
+**Because this app now tracks religious obligations, the no-retroactive-debt rule in
+§5 stops being a nicety.** A tracker that accumulates visible guilt about missed
+prayers is worse than no tracker: the failure mode is avoidance, and the thing avoided
+is not just the app. Show today, show history plainly, and never show a deficit.
 
 ### How `activity_days` gets filled
 
@@ -260,23 +319,43 @@ day ahead of time.
 
 ### In
 
-1. **Tasks** — title, optional due date, done/not done. Create, edit, complete, delete.
-2. **Activities** — name, unit, minimum target, weekly schedule, quick-amount buttons.
-3. **Progress logging** — one-tap increments, custom amount, optional note, and
-   backdating to a previous day.
-4. **Today screen** — tasks due today, each scheduled activity with `done / target`,
-   and the quick-log buttons. This is the home screen and where I will spend ~all my time.
-5. **History** — per-activity view of the last N days: target, actual, entries.
-6. **Export** — `GET /export` returns the whole database as JSON. My user-facing backup.
+1. **Areas** — user-defined, CRUD, assignable to tasks and activities. The organising
+   axis for everything else, which is why it is in v1 rather than added later.
+2. **Tasks** — title, area, optional scheduled date, done/not done, optional duration.
+   Create, edit, complete, delete. Scheduling for a future date is core, not an extra.
+3. **Activities** — name, area, unit, minimum target, weekly schedule, display style.
+4. **Progress logging** — **free numeric entry is the primary input**; optional
+   per-activity shortcut buttons where the amount really is repetitive. Optional note,
+   and backdating to a previous day.
+5. **Timer** — start on a task or activity, stop to write a progress entry (or a task
+   duration) of the elapsed minutes. Server-side start time, no live ticking display.
+6. **Today screen** — grouped by area: tasks scheduled today, each scheduled activity
+   with `done / target`, and any running timer. Gregorian and Hijri date in the header.
+   This is the home screen and where I will spend ~all my time.
+7. **History** — per-activity view of the last N days: target, actual, entries.
+8. **Export** — `GET /export` returns the whole database as JSON. My user-facing backup.
 
 ### Explicitly out
 
-Projects, priorities, task descriptions, subtasks, reminders, notifications, Pomodoro
-timers, streaks and gamification, analytics, calendar views, drag-and-drop, multi-user,
-collaboration, any offline support, any sync, any JS framework.
+Priorities, task descriptions, subtasks, separate due-vs-scheduled dates, recurring
+*tasks* (activities cover recurrence), weekly views and weekly targets, reminders and
+notifications, countdown/Pomodoro timers, a live ticking timer display, streaks and
+gamification, analytics, calendar views, drag-and-drop, multi-user, collaboration, any
+offline support, any sync, any JS framework.
+
+Two deferred things have had their *storage* added early because the column is free
+and the migration later is not: `settings.week_starts_on` (no week view yet) and
+`tasks.duration_min` (no time-per-area reporting yet).
 
 **Rule:** add a field back the first time I actually miss it, not in anticipation.
 Every field I add is a field I have to fill in at 11pm.
+
+**Note on the above rule vs. the v1 growth.** Areas, the timer and Hijri dates were
+added after the first draft of this document, which is a real expansion. It is
+allowed because they are not speculative — they come from how the owner already knows
+he will use the app — and because two of them are *structural*: a taxonomy and a date
+semantic are painful to retrofit across every screen and query, whereas a scalar field
+is cheap to add whenever. That is the test to apply to the next request too.
 
 ### Two product decisions worth making now
 
@@ -288,6 +367,23 @@ Every field I add is a field I have to fill in at 11pm.
 - **No retroactive debt, ever.** A missed minimum does not accumulate into anything.
   The failure mode for trackers like this is becoming a guilt machine I avoid opening,
   and I would rather lose the motivational pressure than the habit of logging.
+
+### Hijri dates: display only, never stored
+
+The header shows the Hijri date alongside the Gregorian one. Two rules make this cheap
+instead of contagious:
+
+- **Nothing is ever stored or keyed by a Hijri date.** `day` stays a Gregorian
+  `YYYY-MM-DD` everywhere. Hijri is a render-time formatting concern, full stop. The
+  moment a Hijri string becomes a primary key or a query filter, every ambiguity below
+  infects the data model permanently.
+- **Use the tabular Umm al-Qura calculation**, via a small pure-Go library (no cgo —
+  the image is `FROM scratch`), pinned and verified against known dates in a test.
+
+Astronomical calculation and local moon sighting disagree, and sighting varies by
+country, so the displayed date can legitimately be a day off. That is what
+`settings.hijri_offset_days` (-1 / 0 / +1) is for: a one-line user correction rather
+than an attempt to be authoritative about something the app cannot know.
 
 ---
 
@@ -390,11 +486,13 @@ Each step should end with something I can actually use.
 1. **Skeleton** — `net/http` server, SQLite open + migrations, health endpoint,
    settings row. Containerise it and confirm `time.LoadLocation` works inside the
    `scratch` image.
-2. **Tasks** — full CRUD, server-rendered. Boring on purpose; this is where I learn the
-   template and handler patterns I will reuse.
+2. **Areas, then tasks** — areas first (small, and everything else references them),
+   then task CRUD, server-rendered. This establishes the handler and template patterns
+   reused everywhere after.
 3. **Activities and progress** — the data model from §4, including target snapshots and
    backdating.
-4. **Today screen** — and then tune it until logging is genuinely a few seconds.
+4. **Today screen** — grouped by area, with Hijri in the header and the timer
+   start/stop flow. Then tune it until logging is genuinely a few seconds.
 5. **History + export + backups** — including the restore drill.
 6. **Use it for two weeks. Change nothing.** Keep a list of what is actually missing or
    annoying. That list, not this document, decides v2.
@@ -407,6 +505,9 @@ Test the things where the bugs will actually be:
 - Day rollups: sum of entries vs. `target_snapshot`, including zero-entry scheduled days.
 - Backdating: an entry written today against yesterday's `day`.
 - Target-change history: change a minimum, confirm past days are unaffected.
+- Timer: stop writes the correct elapsed minutes; a timer left running across a day
+  boundary; starting a second timer while one runs is rejected.
+- Hijri conversion against known date pairs, including the offset setting.
 
 Do **not** write sync-ordering tests. There is no sync.
 

@@ -377,13 +377,38 @@ instead of contagious:
   `YYYY-MM-DD` everywhere. Hijri is a render-time formatting concern, full stop. The
   moment a Hijri string becomes a primary key or a query filter, every ambiguity below
   infects the data model permanently.
-- **Use the tabular Umm al-Qura calculation**, via a small pure-Go library (no cgo —
-  the image is `FROM scratch`), pinned and verified against known dates in a test.
+- **Pick one calculated base**, via a small pure-Go library (no cgo — the image is
+  `FROM scratch`), pinned to an exact version and verified against known date pairs in
+  a test.
 
-Astronomical calculation and local moon sighting disagree, and sighting varies by
-country, so the displayed date can legitimately be a day off. That is what
-`settings.hijri_offset_days` (-1 / 0 / +1) is for: a one-line user correction rather
-than an attempt to be authoritative about something the app cannot know.
+### Target: the Egyptian calendar
+
+**The dates should match Egypt, not Saudi Arabia.** This is a real distinction, not a
+detail: Umm al-Qura is the Saudi civil calendar and is what most libraries implement
+by default, while Egypt's Hijri dates come from Dar al-Ifta using its own criterion.
+The two commonly differ by a day, and the difference is not constant — it varies month
+to month, since each is deciding a month *start*.
+
+No library can be relied on to produce the Egyptian calendar automatically, and there
+is no stable machine-readable feed of the announcements. So the design is deliberately
+modest:
+
+1. A calculated base (Umm al-Qura or a tabular calendar — whichever has a maintained,
+   pure-Go implementation; pin it and test it).
+2. `settings.hijri_offset_days` (-1 / 0 / +1) as the alignment control, reachable in
+   one tap from the header rather than buried in Settings, because it will occasionally
+   need nudging.
+
+**Known limitation, accepted:** a single global offset is a blunt instrument for a
+discrepancy that shifts month to month. If it turns out to drift often enough to
+annoy, the upgrade is a small `hijri_month_overrides` table recording the announced
+Gregorian start date of a given Hijri month, falling back to the calculated base for
+months with no override. That is the correct model — a month start is announced once
+and applies to the whole month — but it is not worth building until the simple offset
+has actually proven insufficient.
+
+This stays purely cosmetic either way: because nothing is stored or keyed by a Hijri
+date, being a day off is a wrong label on a screen, never wrong data.
 
 ---
 

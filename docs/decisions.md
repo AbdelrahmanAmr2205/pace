@@ -100,7 +100,7 @@ Do not build either until the lack is actually annoying in daily use.
 | Language | Go | The point of the project. |
 | HTTP | stdlib `net/http` | Go 1.22+ routing patterns are enough. No framework. |
 | Templates | stdlib `html/template` | Server-rendered. No build step, no bundler. |
-| Database | SQLite via `modernc.org/sqlite` | Pure Go — no cgo, so cross-compilation stays trivial. WAL mode. |
+| Database | SQLite via `modernc.org/sqlite` | Pure Go — no cgo, so cross-compilation stays trivial. WAL mode; see §4 for the required connection pragmas. |
 | DB access | `database/sql` + hand-written SQL | Learning value. Consider `sqlc` later if the SQL gets repetitive. |
 | JS | None in v1 | Plain HTML forms. A full page load per interaction is fast enough. |
 | CSS | One hand-written mobile-first stylesheet | No framework. |
@@ -139,8 +139,8 @@ Constraints that keep it from becoming a liability:
 
 Image distribution: GHCR (free for personal use, and real practice). Build and push
 from the laptop, pull on the VM. If I would rather not depend on a registry at all,
-`docker save pace:latest | gzip | ssh pace 'gunzip | docker load'` works and needs no
-account.
+`docker save pace:latest | gzip | ssh ec2-user@pace 'gunzip | sudo docker load'` works
+and needs no account.
 
 **Rejected: ECR.** It would tie image storage to the provider I am explicitly planning
 to leave. Same reasoning as the section below.
@@ -174,7 +174,9 @@ Design rules that are not negotiable:
 
 1. **Progress entries are append-only.** The day's total is always
    `SUM(amount)`, never a mutable counter. This is what makes history trustworthy and
-   what makes a future offline queue conflict-free.
+   what makes a future offline queue conflict-free. **Mistakes are corrected by
+   appending a reversing row, never by editing or deleting one** — see "Undo without
+   mutating history" below.
 2. **Amounts are integers in the activity's base unit** (minutes, pages, reps,
    metres). No floats — "did I hit the minimum" should never be a floating-point
    comparison. Display formatting is a presentation concern.
@@ -204,7 +206,8 @@ CREATE TABLE tasks (
     area_id       TEXT REFERENCES areas(id),
     scheduled_for TEXT,                    -- local 'YYYY-MM-DD'; drives the Today screen
     done_at       TEXT,                    -- UTC RFC3339; NULL = not done
-    duration_min  INTEGER,                 -- optional; how long it actually took
+    duration_min  INTEGER CHECK (duration_min IS NULL OR duration_min > 0),
+                                           -- optional; how long it actually took
     created_at    TEXT NOT NULL,
     updated_at    TEXT NOT NULL
 );
@@ -214,11 +217,13 @@ CREATE TABLE activities (
     id             TEXT PRIMARY KEY,
     name           TEXT NOT NULL,
     unit           TEXT NOT NULL,          -- 'minutes' | 'pages' | 'reps' | 'metres' | ...
-    unit_kind      TEXT NOT NULL,          -- 'time' | 'quantity'  (drives display only)
-    minimum_target INTEGER NOT NULL,       -- current target, in base units
+    unit_kind      TEXT NOT NULL CHECK (unit_kind IN ('time','quantity')),
+                                           -- 'time' => the base unit is ALWAYS minutes
+    minimum_target INTEGER NOT NULL CHECK (minimum_target > 0),  -- in base units
     schedule       TEXT NOT NULL,          -- weekday bitmask or 'daily'
     area_id        TEXT REFERENCES areas(id),
-    display_style  TEXT NOT NULL DEFAULT 'card',  -- 'card' | 'compact'; see §5
+    display_style  TEXT NOT NULL DEFAULT 'card'
+                   CHECK (display_style IN ('card','compact')),  -- see §5
     quick_amounts  TEXT,                   -- OPTIONAL '25,10' → extra +25 / +10 buttons
                                            -- alongside the free-entry field. Often NULL.
     sort_order     INTEGER NOT NULL DEFAULT 0,
@@ -227,25 +232,35 @@ CREATE TABLE activities (
     updated_at     TEXT NOT NULL
 );
 
--- One row per (activity, day) it was scheduled for. Created lazily; NEVER updated
--- once written. This is the target snapshot.
+-- One row per (activity, day) it was scheduled for. Materialised at the day
+-- boundary; NEVER updated once written. This is the target snapshot.
 CREATE TABLE activity_days (
     id              TEXT PRIMARY KEY,
     activity_id     TEXT NOT NULL REFERENCES activities(id),
     day             TEXT NOT NULL,         -- local 'YYYY-MM-DD'
-    target_snapshot INTEGER NOT NULL,
+    target_snapshot INTEGER NOT NULL CHECK (target_snapshot > 0),
     created_at      TEXT NOT NULL,
     UNIQUE (activity_id, day)
 );
 
--- Append-only log of work actually done.
+-- Append-only log of work actually done. Corrections are new rows; nothing here is
+-- ever UPDATEd or DELETEd.
 CREATE TABLE progress_entries (
-    id          TEXT PRIMARY KEY,          -- client-suppliable, for idempotent retries
-    activity_id TEXT NOT NULL REFERENCES activities(id),
-    day         TEXT NOT NULL,             -- local 'YYYY-MM-DD'; may be backdated
-    amount      INTEGER NOT NULL,          -- base units; positive
-    note        TEXT,
-    recorded_at TEXT NOT NULL              -- UTC RFC3339, when it was entered
+    id                TEXT PRIMARY KEY,    -- client-suppliable, for idempotent retries
+    activity_id       TEXT NOT NULL REFERENCES activities(id),
+    day               TEXT NOT NULL,       -- local 'YYYY-MM-DD'; may be backdated
+    amount            INTEGER NOT NULL CHECK (amount <> 0),
+                                           -- base units; negative ONLY on a reversal
+    duration_min      INTEGER CHECK (duration_min IS NULL OR duration_min > 0),
+                                           -- wall-clock minutes, written by the timer
+                                           -- stop flow. Equals amount when
+                                           -- unit_kind='time'. NULL if hand-typed.
+    note              TEXT,
+    reverses_entry_id TEXT UNIQUE REFERENCES progress_entries(id),
+                                           -- set only on a correction row. UNIQUE
+                                           -- permits many NULLs, so this reads as
+                                           -- "an entry may be reversed at most once"
+    recorded_at       TEXT NOT NULL        -- UTC RFC3339, when it was entered
 );
 
 CREATE INDEX idx_progress_activity_day ON progress_entries (activity_id, day);
@@ -256,8 +271,10 @@ CREATE TABLE settings (
     id                INTEGER PRIMARY KEY CHECK (id = 1),
     timezone          TEXT NOT NULL,       -- IANA name
     day_starts_at     TEXT NOT NULL DEFAULT '04:00',
-    week_starts_on    INTEGER NOT NULL DEFAULT 6,  -- 0=Sun .. 6=Sat
+    week_starts_on    INTEGER NOT NULL DEFAULT 6   -- 0=Sun .. 6=Sat
+                      CHECK (week_starts_on BETWEEN 0 AND 6),
     hijri_offset_days INTEGER NOT NULL DEFAULT 0   -- -1 / 0 / +1, display only
+                      CHECK (hijri_offset_days BETWEEN -2 AND 2)
 );
 
 -- At most one timer runs at a time; the row exists only while it is running.
@@ -271,6 +288,29 @@ CREATE TABLE active_timer (
     CHECK ((task_id IS NULL) <> (activity_id IS NULL))
 );
 ```
+
+### SQLite runtime settings
+
+The schema above is only half the story. **SQLite defaults `foreign_keys` to OFF, per
+connection** — so without this, every `REFERENCES` clause above is decorative and a
+typo'd `activity_id` inserts happily. `database/sql` pools connections, so the settings
+have to be attached to the DSN, where the driver applies them to every connection it
+opens, not run once at startup.
+
+```
+file:/data/pace.db?_pragma=journal_mode(WAL)&_pragma=foreign_keys(ON)&_pragma=busy_timeout(5000)&_pragma=synchronous(NORMAL)
+```
+
+- **`_pragma=name(value)` is `modernc.org/sqlite`'s syntax.** The mattn-style
+  `?_foreign_keys=on&_journal_mode=WAL` spelling that most blog posts use is **silently
+  ignored** by this driver — no error, foreign keys just stay off. Worth a test that
+  asserts `PRAGMA foreign_keys` reads back as 1.
+- `busy_timeout` makes a writer wait for a lock instead of failing instantly.
+- `synchronous=NORMAL` is the correct pairing with WAL: safe against process crashes,
+  and only at risk from an OS-level crash mid-write.
+- **`db.SetMaxOpenConns(1)`.** With one user there is no throughput to lose, and it
+  removes `SQLITE_BUSY` as a category rather than handling it. Revisit only if a page
+  ever feels slow because of it.
 
 ### Habits are not a new entity
 
@@ -303,15 +343,95 @@ is not just the app. Show today, show history plainly, and never show a deficit.
 
 ### How `activity_days` gets filled
 
-When any day is rendered, upsert an `activity_days` row for every non-archived
-activity scheduled on that day, snapshotting the current `minimum_target` — and never
-overwrite an existing row. That covers both "scheduled but I did nothing" and "target
-changed later."
+One function, `MaterialiseDay(day)`: insert a row for every non-archived activity
+scheduled on that day, snapshotting the current `minimum_target`, skipping days before
+the activity was created, and **never overwriting an existing row**. It has exactly
+three call sites:
 
-**Known limitation, accepted:** if I don't open the app for a week, those days get
-their rows created whenever I eventually look at them, snapshotting the *then-current*
-target. Fine for a personal app. If it ever matters, a nightly job can materialise the
-day ahead of time.
+1. **A ticker at each local day boundary.** The normal path.
+2. **Server startup**, catching up every day between the last materialised day and
+   today. Covers restarts, deploys and downtime.
+3. **Immediately before any target or schedule change.** A belt-and-braces guarantee
+   that today's row exists before the thing that would change it.
+
+**Why not fill lazily when a day is rendered.** The earlier design created rows on
+view, which had two failure modes. The mild one: look at a day a week later and it gets
+today's target. The serious one is about *schedules* — if an activity was scheduled on
+Sundays and I later drop Sunday, then look back at a past Sunday, no row is created and
+the system has silently forgotten that Sunday was ever expected. History gains a hole
+rather than a wrong number, and progress entries can end up on a day with no
+corresponding `activity_days` row at all.
+
+**This is now correct, not merely better.** A target can only change while the server
+is running, and while the server is running the boundary ticker fires. So the startup
+catch-up after downtime writes exactly the target those days would have been given at
+the time — there is no window in which a change goes unrecorded. The only way to defeat
+it is to edit the database by hand while the process is stopped.
+
+Cost: roughly `activities × 365` rows a year. At any plausible number of activities
+that is a few thousand rows, which SQLite does not notice.
+
+### Undo without mutating history
+
+Append-only is the right default, but an append-only log with no correction mechanism
+is not usable software. Tapping `+25` twice, or typing `250` for `25`, will happen —
+and the faster capture gets, the more often it will. A capture flow you are afraid of
+is a slow capture flow, which defeats the whole point.
+
+**Undo is an insert, not a delete.** A correction row carries `reverses_entry_id`
+pointing at the original and an `amount` that is exactly its negation. Both
+non-negotiables survive untouched: nothing is ever mutated, and the day total stays a
+plain `SUM(amount)` with no filtering.
+
+Rules, all enforced server-side and tested:
+
+- The reversal is **generated by the server**, never supplied by the client: it copies
+  the original's `activity_id` and `day` and negates its `amount`.
+- An entry can be reversed at most once — enforced by `UNIQUE (reverses_entry_id)`.
+- **A reversal cannot itself be reversed.** Otherwise "undo the undo" becomes a way to
+  walk a total anywhere.
+- History renders a reversed pair as one struck-through line, not as two rows of noise.
+
+### Timers, duration and amount
+
+The naive design — "stopping a timer writes the elapsed minutes as a progress entry" —
+contradicts the rule that `amount` is in the activity's base unit. A timer on
+*Read book* (`unit='pages'`) cannot produce a valid entry that way.
+
+The fix is not to ban timers on those activities. It is to notice that **elapsed time
+and amount are two different facts**, and to store both:
+
+- `progress_entries.duration_min` — wall-clock minutes, written by the timer.
+- `progress_entries.amount` — the thing being counted, in the activity's base unit.
+
+For `unit_kind='time'` they hold the same number; for everything else they do not.
+That is why **time activities always store minutes as their base unit** — `unit` may
+display as hours, but the stored integer is minutes, which keeps the comparison against
+`minimum_target` exact.
+
+The payoff is that "how much time did I spend on Health this month" becomes one query
+over `progress_entries.duration_min` plus `tasks.duration_min`, across every activity
+regardless of what it counts.
+
+**Stopping a timer always opens a confirmation form**, with the elapsed minutes
+pre-filled and editable:
+
+| Timer on | The form asks for | Written to |
+|---|---|---|
+| Activity, `unit_kind='time'` | duration (= amount) | one `progress_entry` |
+| Activity, `unit_kind='quantity'` | duration, pre-filled; **and** amount | one `progress_entry` |
+| Task | duration | `tasks.duration_min` |
+
+The extra tap is deliberate. Timers get forgotten — left running overnight, a timer
+would otherwise append 840 minutes to an append-only log, and the only remedy would be
+a reversal. The edit step is what keeps garbage out in the first place. It is also not
+the hot path: quick capture means typing an amount on the Today screen, which is
+untouched by this.
+
+Two more rules: stopping a task's timer records the duration but does **not** mark the
+task done — those are separate acts. And a timer running across a day boundary books to
+the day it **started**, since that is when the work happened; the ordinary backdating
+control can move it.
 
 ---
 
@@ -327,13 +447,19 @@ day ahead of time.
 4. **Progress logging** — **free numeric entry is the primary input**; optional
    per-activity shortcut buttons where the amount really is repetitive. Optional note,
    and backdating to a previous day.
-5. **Timer** — start on a task or activity, stop to write a progress entry (or a task
-   duration) of the elapsed minutes. Server-side start time, no live ticking display.
+5. **Timer** — start on any task or activity. Stopping opens a short form with the
+   elapsed minutes pre-filled and editable, then writes a progress entry (or a task
+   duration). Server-side start time, no live ticking display. Full rules in §4,
+   "Timers, duration and amount".
 6. **Today screen** — grouped by area: tasks scheduled today, each scheduled activity
    with `done / target`, and any running timer. Gregorian and Hijri date in the header.
    This is the home screen and where I will spend ~all my time.
 7. **History** — per-activity view of the last N days: target, actual, entries.
-8. **Export** — `GET /export` returns the whole database as JSON. My user-facing backup.
+8. **Export** — `GET /export` returns the whole database as JSON. This is portability
+   and human-readable review, **not the backup**. The snapshot described in §6 is what
+   you actually restore from.
+9. **CSRF rejection.** Middleware that refuses any state-changing request whose
+   `Origin` is not this app's own. See below.
 
 ### Explicitly out
 
@@ -356,6 +482,27 @@ allowed because they are not speculative — they come from how the owner alread
 he will use the app — and because two of them are *structural*: a taxonomy and a date
 semantic are painful to retrofit across every screen and query, whereas a scalar field
 is cheap to add whenever. That is the test to apply to the next request too.
+
+### Why CSRF protection, when there is no login
+
+Tailscale means nothing on the internet can *open a connection* to the app. It does not
+mean nothing on the internet can persuade **my own browser** to open one. Any site I
+visit on a device with Tailscale running can auto-submit a form at
+`https://pace.<tailnet>.ts.net/progress` and the request will arrive looking entirely
+legitimate.
+
+There is no session cookie to steal here, which is exactly why this matters: the only
+ambient authority the app recognises is *being on the tailnet*, and the browser carries
+that authority into every tab. A cross-site POST inherits it for free.
+
+The fix is about ten lines and needs no tokens, no sessions and no state: **reject any
+`POST`/`PUT`/`DELETE` whose `Origin` header does not match this app's own origin**, with
+`Sec-Fetch-Site: same-origin` as a secondary signal. The expected origin comes from
+config so that `localhost:8080` still works in development.
+
+This goes in the skeleton (step 1), not deferred alongside authentication. It is not
+authentication, it costs nothing, and retrofitting it across every handler later is
+strictly more work than writing one middleware now.
 
 ### Two product decisions worth making now
 
@@ -457,24 +604,48 @@ rushed — this is the one part of the app where a mistake exposes my data.
 
 The requirement is tiny: one always-on VM, 512 MB RAM, one container, one SQLite file.
 
-**Phase 1 — AWS EC2 (~3–4 months).** Checked: the free window is roughly three months,
-not perpetual. Starting here anyway, on purpose, because getting hands-on with EC2,
-security groups, EBS and IAM is worth something independent of this app, and a known
-expiry date is a feature — it forces the migration to actually happen instead of
-becoming a someday task.
+**Phase 1 — AWS EC2 (up to six months).** The current Free account plan gives $100 of
+credits on signup, up to $100 more for completing activities, and **ends after six
+months or when the credits run out, whichever comes first**. Do not plan against a
+remembered number — the Billing console shows the real balance and date.
 
-**Phase 2 — Oracle Cloud Always Free.** The Ampere A1 allowance (ARM) is far larger
-than this app will ever need and does not expire. Two things to verify before
-committing, because they are the usual complaints:
+Starting here on purpose: hands-on EC2, security groups, EBS and IAM is worth something
+independent of this app, and a known expiry date forces the migration to happen instead
+of becoming a someday task.
 
-- A1 capacity is frequently unavailable in popular regions; pick the region on
-  availability, not on latency.
-- Always-Free tenancies have historically had **idle-resource reclamation** — an
-  instance below low CPU/network/memory thresholds over a week can be reclaimed. A
-  personal to-do app is the definition of idle by those metrics. The standard fix is
-  upgrading the account to Pay As You Go, which stops reclamation while keeping the
-  Always Free resources free. Confirm the current policy before relying on it, and do
-  not let the only copy of the data live somewhere that can be reclaimed.
+**The expiry is harsher than it sounds, and this is the part to internalise.** When a
+Free account plan ends, *the account closes automatically* and access to resources and
+data goes with it. AWS holds the content for 90 days before deleting it permanently, and
+the only way to get it back is to upgrade to a paid plan within that window. So the
+deadline is not "start paying" — it is "the instance and its EBS volume become
+unreachable." Two consequences, both already required for other reasons: the database
+must exist somewhere other than that box, and the calendar reminder from
+[`setup-aws.md`](setup-aws.md) §1 is load-bearing rather than tidy.
+
+Verified 2026-09-14 against AWS's billing documentation; re-check rather than trusting
+this paragraph in six months.
+
+**Phase 2 — Oracle Cloud Always Free.** The Ampere A1 (ARM) allowance is 1,500 OCPU
+hours and 9,000 GB hours per month — **2 OCPUs and 12 GB of memory** run continuously,
+split across one instance or two. Smaller than the figure that circulates in older
+write-ups, and still many times more than this app will use. It does not expire.
+
+Two things to plan around:
+
+- **A1 capacity is frequently unavailable** in popular regions. Pick the region on what
+  you can actually launch, not on latency.
+- **Idle-resource reclamation is real and still current.** Oracle deems a compute
+  instance idle if, over a 7-day window, 95th-percentile CPU is under 20%, network is
+  under 20%, *and* — for A1 shapes specifically — memory is under 20%. A personal
+  to-do app is the textbook case. Reclaimed means stopped and, for Always Free
+  resources, recoverable only up to a point. The usual fix is upgrading the tenancy to
+  Pay As You Go, which keeps the Always Free resources free while exempting them from
+  reclamation.
+
+  Verified 2026-09-14 against Oracle's technical documentation. A second opinion during
+  review claimed this policy had been withdrawn; it has not — the marketing FAQ reads
+  more softly than the docs. **Do not let the only copy of the data live somewhere that
+  can be reclaimed**, whichever way the policy goes.
 
 **Make the migration boring in advance:**
 
@@ -491,12 +662,19 @@ committing, because they are the usual complaints:
 
 ### Backups
 
-- Nightly `VACUUM INTO` a timestamped file; keep 7 days on the box.
-- Copy the newest one off the box. Primary: `scp` to the laptop on a timer — provider-
-  neutral, free, and survives the account expiring. Optional while on AWS: also push to
-  S3 for the practice, but keep it to one line in a script so the migration does not
-  drag it along.
-- `GET /export` as the manual, human-readable backup.
+- **The Go process takes its own snapshot**, running `VACUUM INTO` on a timer to a
+  timestamped file under the bind-mounted `/data`; keep 7 days on the box.
+
+  This is not a stylistic preference. The runtime image is `FROM scratch`, so there is
+  **no `sqlite3` binary inside it** — any backup plan phrased as a shell command has no
+  execution path at all without adding a sidecar container or abandoning the scratch
+  base. `VACUUM INTO` is one `db.Exec` away in Go, is safe against a live database, and
+  produces a single compact file. Do not reintroduce `sqlite3 .backup` anywhere.
+- **Copy the newest one off the box**: `scp`/`rsync` to the laptop on a timer, over
+  Tailscale. Provider-neutral, free, and it is what survives the AWS account closing.
+  Optional while on AWS: also push to S3 for the practice, but keep it to one line in a
+  script so the migration does not drag it along.
+- `GET /export` is the human-readable JSON export, not the backup.
 - **Do a restore drill once**, early. An untested backup is not a backup.
 
 ---
@@ -505,12 +683,13 @@ committing, because they are the usual complaints:
 
 Each step should end with something I can actually use.
 
-0. **Server reachable** — EC2 instance, Docker, Tailscale, `tailscale serve`, and a
-   hello-world container. Open it from the phone over cellular *before writing any
-   application code*. Runbook: [`docs/setup-server.md`](setup-server.md).
-1. **Skeleton** — `net/http` server, SQLite open + migrations, health endpoint,
-   settings row. Containerise it and confirm `time.LoadLocation` works inside the
-   `scratch` image.
+0. **Server reachable** — AWS account, EC2 instance, Docker, Tailscale,
+   `tailscale serve`, and a hello-world container. Open it from the phone *before
+   writing any application code*. Runbooks: [`docs/setup-aws.md`](setup-aws.md), then
+   [`docs/setup-server.md`](setup-server.md).
+1. **Skeleton** — `net/http` server, SQLite open with the §4 connection pragmas +
+   migrations, CSRF middleware, health endpoint, settings row. Containerise it and
+   confirm `time.LoadLocation` works inside the `scratch` image.
 2. **Areas, then tasks** — areas first (small, and everything else references them),
    then task CRUD, server-rendered. This establishes the handler and template patterns
    reused everywhere after.
@@ -530,8 +709,21 @@ Test the things where the bugs will actually be:
 - Day rollups: sum of entries vs. `target_snapshot`, including zero-entry scheduled days.
 - Backdating: an entry written today against yesterday's `day`.
 - Target-change history: change a minimum, confirm past days are unaffected.
-- Timer: stop writes the correct elapsed minutes; a timer left running across a day
-  boundary; starting a second timer while one runs is rejected.
+- **Materialisation**: the boundary ticker; startup catch-up across several missed days;
+  never overwriting an existing row; no rows before an activity existed; archived
+  activities skipped.
+- **Schedule-change history**: drop a weekday from a schedule, then confirm past days
+  that were scheduled still report as scheduled.
+- **Reversal**: the total returns to its prior value; an entry cannot be reversed twice;
+  a reversal cannot be reversed; the reversal's `day` and `activity_id` match the
+  original's.
+- **Connection pragmas**: `PRAGMA foreign_keys` reads back as 1 on a pooled connection,
+  and a bad foreign key is actually rejected.
+- Timer: stop on a time activity, on a quantity activity, and on a task; the edited
+  duration is what gets written; a timer running across a day boundary books to the day
+  it started; starting a second timer while one runs is rejected.
+- **CSRF middleware**: a same-origin POST passes, a foreign `Origin` is rejected, a
+  missing `Origin` on an unsafe method is rejected, and GET is unaffected.
 - Hijri conversion against known date pairs, including the offset setting.
 
 Do **not** write sync-ordering tests. There is no sync.

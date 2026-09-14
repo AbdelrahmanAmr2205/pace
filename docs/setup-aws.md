@@ -73,12 +73,24 @@ billing information → **Activate**. Without this, your day-to-day identity get
 blank Billing page no matter what its IAM policy says. Newer accounts often ship with
 this on — check rather than assume.
 
-**f. Confirm which free tier you are on.** Billing and Cost Management → Free tier.
-AWS changed the model in mid-2025: older accounts get 12 months of specific free
-allowances; newer ones get a credit balance that everything draws down, with the free
-plan ending when credits run out or after a fixed window. You said "at least three
-months" — this page is what actually decides that. Read your own number here and put
-the end date in your calendar today, with a reminder two weeks earlier.
+**f. Confirm which free tier you are on, and read the expiry carefully.**
+Billing and Cost Management → Free tier.
+
+A new account today picks a **Free account plan** or a **Paid account plan**. Either way
+you get $100 in credits at signup and can earn up to $100 more by completing activities.
+The Free plan then **ends after six months or when the credits run out, whichever comes
+first**. Read your own balance and date on that page rather than trusting any number,
+including the ones here.
+
+**The part that matters more than the date:** when a Free account plan expires, *the
+account closes automatically* and you lose access to your resources and data. AWS holds
+the content for 90 days before deleting it permanently, and the only way back is
+upgrading to a paid plan inside that window. This is not "your instance starts costing
+money" — it is "your instance and its EBS volume become unreachable."
+
+So: put the end date in your calendar **today**, with a reminder a month earlier, not
+two weeks. And treat §10's off-box backup as the thing that makes this survivable rather
+than as housekeeping.
 
 ---
 
@@ -287,13 +299,32 @@ No managed policy. Just this:
       }
     },
     {
-      "Sid": "ShellIntoThePaceInstance",
+      "Sid": "ShellIntoOnlyThePaceInstance",
       "Effect": "Allow",
-      "Action": "ssm:StartSession",
+      "Action": [
+        "ssm:StartSession",
+        "ssm:SendCommand"
+      ],
       "Resource": "arn:aws:ec2:*:*:instance/*",
       "Condition": {
         "StringEquals": { "ssm:resourceTag/Project": "pace" }
       }
+    },
+    {
+      "Sid": "StartSessionAlsoNeedsTheShellDocument",
+      "Effect": "Allow",
+      "Action": "ssm:StartSession",
+      "Resource": "arn:aws:ssm:*:*:document/SSM-SessionManagerRunShell"
+    },
+    {
+      "Sid": "TheSessionStreamItself",
+      "Effect": "Allow",
+      "Action": [
+        "ssmmessages:OpenDataChannel",
+        "ssm:TerminateSession",
+        "ssm:ResumeSession"
+      ],
+      "Resource": "arn:aws:ssm:*:*:session/${aws:userid}-*"
     },
     {
       "Sid": "SessionManagerPlumbing",
@@ -302,9 +333,7 @@ No managed policy. Just this:
         "ssm:DescribeSessions",
         "ssm:GetConnectionStatus",
         "ssm:DescribeInstanceInformation",
-        "ssm:DescribeInstanceProperties",
-        "ssm:TerminateSession",
-        "ssm:ResumeSession"
+        "ssm:DescribeInstanceProperties"
       ],
       "Resource": "*"
     }
@@ -312,10 +341,29 @@ No managed policy. Just this:
 }
 ```
 
-Note the tag conditions. This permission set can reboot **an instance tagged
-`Project=pace`** and nothing else — not a future instance you forget to tag, not
+Note the tag conditions. This permission set can reboot and shell into **an instance
+tagged `Project=pace`** and nothing else — not a future instance you forget to tag, not
 anything an attacker creates. Tag-based conditions are the cheapest scoping mechanism
 AWS offers, which is why §6d insists on tagging at launch.
+
+**Three details that make the difference between this working and a baffling
+`AccessDenied`**, all of them from AWS's own Session Manager samples:
+
+- **`ssm:StartSession` needs the *document* as well as the instance.** A session runs a
+  document — `SSM-SessionManagerRunShell` — and the authorisation check covers both. It
+  gets its own statement because the document carries no `Project` tag, so the tag
+  condition cannot apply to it.
+- **`ssmmessages:OpenDataChannel` is the session's actual data stream.** Without it the
+  session is authorised and then cannot carry any bytes.
+- **The tag condition key differs by service.** EC2 power actions test
+  `ec2:ResourceTag/...`; the SSM actions test `ssm:resourceTag/...`. Putting them in one
+  statement would silently deny, because a condition key that does not exist in the
+  request context evaluates as not-matched.
+
+One deviation from AWS's published sample, deliberate: it scopes session resources with
+`${aws:username}`, which **does not resolve under IAM Identity Center** — there is no
+IAM user behind the session. `${aws:userid}` is the right variable here. If you took the
+plain-IAM-user path in §5, either works.
 
 This is the part of the setup where least privilege is real rather than ceremonial: the
 permissions are narrow *and* they cover essentially everything you do after launch day.
@@ -504,15 +552,19 @@ Everything else is `PaceAdmin`.
 
 ## 10. Leaving (you are on a clock)
 
-You are moving to Oracle Cloud in roughly three months. Two things to do now so that is
-a copy rather than a rescue:
+You are moving to Oracle Cloud within six months — and per §1f, the account *closes* at
+the end rather than merely starting to bill. Two things to do now so that is a copy
+rather than a rescue:
 
 **Keep backups provider-neutral.** The tempting AWS answer is EBS snapshots via Data
-Lifecycle Manager. Do not build on it: it costs storage, and it is exactly the kind of
-provider-specific dependency `decisions.md` rules out. The portable answer is a nightly
-`sqlite3 .backup` into a file plus a pull to your laptop over Tailscale — which works
-identically on Oracle, and which you can actually restore from without AWS. Details
-belong in roadmap step 5.
+Lifecycle Manager. Do not build on it: it costs storage, it dies with the account, and
+it is exactly the kind of provider-specific dependency `decisions.md` rules out.
+
+The portable answer is the app taking its own `VACUUM INTO` snapshot on a timer, plus a
+pull to your laptop over Tailscale. Note that it has to be the *app* — the runtime image
+is `FROM scratch` and contains no `sqlite3` binary, so there is nothing on the box to run
+a CLI backup with. `VACUUM INTO` is one `db.Exec` from Go, safe against a live database,
+and works identically on Oracle. Details in `decisions.md` §6 and roadmap step 5.
 
 **Rehearse the migration while AWS is still free.** Standing up the Oracle box before
 the AWS one expires means the migration is a rehearsal with a working fallback, instead

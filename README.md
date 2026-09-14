@@ -34,7 +34,7 @@ clients, so there is exactly one copy of the data and no synchronisation layer a
 ## Design principles
 
 - **Progress entries are append-only.** A day's total is always `SUM(amount)`, never a
-  mutable counter.
+  mutable counter. Undo appends a reversing row rather than deleting anything.
 - **Amounts are integers** in the activity's base unit. "Did I hit the minimum" is
   never a floating-point comparison.
 - **Each day's target is snapshotted**, so raising a minimum next month does not

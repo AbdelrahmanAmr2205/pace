@@ -74,11 +74,22 @@ A paragraph in the response, not a wall of comments in the code.
 These are decided. Reopen them via `docs/decisions.md`, not mid-task.
 
 - **Progress entries are append-only.** Totals are always `SUM(amount)`. Never add a
-  mutable running-total column.
+  mutable running-total column. **Corrections append a reversing row** (negative
+  `amount`, `reverses_entry_id` set) — never an UPDATE, never a DELETE, never a
+  `voided_at` flag that would force totals to start filtering.
 - **Amounts are integers** in the activity's base unit (minutes, pages, reps, metres).
   No floats — hitting a minimum must never be a float comparison.
 - **`activity_days.target_snapshot` is written once and never updated.** Changing an
-  activity's target must not rewrite history.
+  activity's target must not rewrite history. Rows are materialised by the day-boundary
+  job, on startup catch-up, and before any target/schedule mutation — **not lazily when
+  a page is rendered**, which loses schedule history. See `decisions.md` §4.
+- **Elapsed time and amount are different columns.** `duration_min` is wall-clock
+  minutes; `amount` is in the activity's base unit. They coincide only when
+  `unit_kind='time'`, for which the base unit is always minutes. A timer is valid on any
+  activity — do not propose restricting it to time-based ones.
+- **`foreign_keys` must be ON for every connection.** SQLite defaults it OFF per
+  connection, and `modernc.org/sqlite` silently ignores mattn-style DSN parameters. Set
+  it via `_pragma=foreign_keys(ON)` in the DSN and keep the test that asserts it.
 - **`import _ "time/tzdata"`** must stay in the binary. The image is `FROM scratch`
   with no `/usr/share/zoneinfo`, and the day boundary depends on IANA timezones.
 - **Hijri dates are display-only.** Never stored, never a key, never a query filter.
@@ -90,8 +101,13 @@ These are decided. Reopen them via `docs/decisions.md`, not mid-task.
   a plainly published port can reach the internet regardless of the cloud firewall.
 - **No JavaScript, no CSS framework, no web framework, no ORM** in v1. Stdlib
   `net/http` and `html/template`, hand-written SQL, one hand-written stylesheet.
-- **Nothing provider-specific.** The app moves from AWS to Oracle Cloud in ~3 months;
-  it must stay a static binary plus one SQLite file.
+- **CSRF middleware guards every unsafe method.** Tailscale stops the internet opening
+  connections; it does not stop another site making *your* browser open one, and network
+  position is the only authority this app has. Reject mismatched `Origin` on
+  POST/PUT/DELETE.
+- **Nothing provider-specific.** The app moves from AWS to Oracle Cloud within six
+  months (the AWS account *closes* at the end of the free plan); it must stay a static
+  binary plus one SQLite file.
 
 ## Scope discipline
 

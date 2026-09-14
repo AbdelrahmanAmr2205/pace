@@ -1,8 +1,8 @@
 # Server setup runbook — EC2 + Docker + Tailscale
 
-Goal of this document: get to a URL that opens on the phone **over cellular**, serving
-a hello-world container over real HTTPS, with nothing exposed to the public internet.
-No application code involved. This is step 0 of the build order.
+Goal of this document: get to a URL that **opens on the phone**, serving a hello-world
+container over real HTTPS, with nothing exposed to the public internet. No application
+code involved. This is step 0 of the build order.
 
 Rationale for these choices is in [`decisions.md`](decisions.md) §3 and §6.
 
@@ -40,7 +40,8 @@ Two commands are easy to confuse:
 | `tailscale serve` | Reverse-proxies a local port to your tailnet, with a valid TLS cert. Tailnet-only. | ✅ yes |
 | `tailscale funnel` | Publishes that same service **to the entire internet**. | ❌ never |
 
-Free plan covers personal use comfortably (on the order of 3 users / 100 devices).
+The free Personal plan covers this comfortably: up to 6 users with unlimited user
+devices. (Checked 2026-09-14 — these limits have changed before.)
 
 ---
 
@@ -50,14 +51,17 @@ In the Tailscale admin console (login with a personal identity — GitHub/Google
 
 1. **DNS → enable MagicDNS.** Gives devices names instead of bare IPs.
 2. **DNS → enable HTTPS certificates.** Required for `tailscale serve` to get a cert.
-3. **Settings → Keys → Generate auth key.** For a headless server you cannot do the
-   interactive browser login, so you paste a key instead.
-   - Reusable: **off** (one key, one machine).
-   - Ephemeral: **off** — ephemeral nodes are removed when they go offline, which is
-     wrong for a server that will reboot.
-   - Pre-approved: **on**, if device approval is enabled on the tailnet.
-   - Treat it like a password. It goes in the `tailscale up` command once and is then
-     stored in the node's own state.
+3. **Nothing else.** You do *not* need an auth key. `tailscale up` on a headless box
+   prints a login URL you paste into any browser — the machine never needs its own
+   session. That is the default path in §4.
+
+   An auth key is for unattended provisioning (user-data scripts, image bakes), where
+   there is no human to open a URL. If you use one anyway: Reusable **off**, Ephemeral
+   **off** (ephemeral nodes disappear when they go offline, which is wrong for a server
+   that reboots), Pre-approved **on** if device approval is enabled. And keep it out of
+   your shell history — it is a credential that grants tailnet membership, and a
+   `tskey-auth-...` string sitting in `~/.bash_history` outlives every intention to
+   clean it up.
 
 ---
 
@@ -90,20 +94,47 @@ You should reach a shell through EC2 → Connect → Session Manager before cont
 # Docker (Amazon Linux 2023)
 sudo dnf install -y docker
 sudo systemctl enable --now docker
-sudo usermod -aG docker "$USER"   # log out and back in for this to take effect
 ```
+
+**AL2023's `docker` package does not include the Compose plugin.** `docker compose`
+will simply not exist, which is a confusing failure right at the point you need it.
+Install it as a CLI plugin (arm64 binary; pin the version rather than tracking
+`latest`):
+
+```bash
+sudo mkdir -p /usr/local/lib/docker/cli-plugins
+sudo curl -fsSL -o /usr/local/lib/docker/cli-plugins/docker-compose \
+  https://github.com/docker/compose/releases/download/v2.39.4/docker-compose-linux-aarch64
+sudo chmod +x /usr/local/lib/docker/cli-plugins/docker-compose
+docker compose version      # fail here, not three steps later
+```
+
+**Use `sudo docker`, and do not add yourself to the `docker` group.** Two reasons. The
+group is root-equivalent — anyone in it can mount the host filesystem into a container
+— so it buys convenience at the cost of the privilege boundary you just spent
+`setup-aws.md` building. And it would not even work as intended here: connected through
+Session Manager you are `ssm-user`, but over Tailscale SSH you will be `ec2-user`, so
+`usermod -aG docker "$USER"` silently grants the group to whichever account you happened
+to be using at the time.
 
 ```bash
 # Tailscale
 curl -fsSL https://tailscale.com/install.sh | sh
 ```
 
-Bring the node up. `--ssh` enables Tailscale SSH, which is what lets you close port 22
-later:
+Bring the node up. `--ssh` enables Tailscale SSH, which is how you will reach this box
+from the laptop without any port being open:
 
 ```bash
-sudo tailscale up --authkey=tskey-auth-REPLACE_ME --hostname=pace --ssh
+sudo tailscale up --hostname=pace --ssh
 ```
+
+This prints a URL. Open it in the browser on your laptop, approve the machine, and the
+command returns. No credential is typed on the server and none ends up in your history.
+
+(If you ever need the unattended form, it is
+`sudo tailscale up --hostname=pace --ssh --auth-key="$TS_KEY"` with the key supplied
+through the environment rather than typed on the command line.)
 
 Then, **in the admin console, open the `pace` node and disable key expiry.** Node keys
 expire by default (commonly 180 days). An expired server silently vanishes from the
@@ -135,11 +166,11 @@ services:
 
 ```bash
 sudo mkdir -p /srv/pace/data
-cd /srv/pace && docker compose up -d
+cd /srv/pace && sudo docker compose up -d
 curl -s localhost:8080 | head -5
 ```
 
-**Why `127.0.0.1:8080:8080` and not `8080:8080`:** Docker writes its own iptables
+**Why `127.0.0.1:8080:80` and not `8080:80`:** Docker writes its own iptables
 rules, and a plainly published port can end up reachable from the internet even when
 the cloud firewall says otherwise. Binding to the loopback interface means the only
 way in is through Tailscale. Keep this in the real compose file too.
@@ -165,7 +196,15 @@ about certificates at all.
 **Now switch to your permanent way in:**
 
 1. Install Tailscale on the laptop, log in with the same identity.
-2. Confirm `ssh pace` works over Tailscale SSH.
+2. Confirm `ssh ec2-user@pace` works over Tailscale SSH. **Specify the user.** Tailscale
+   SSH defaults to your *laptop's* username, which does not exist on Amazon Linux, so a
+   bare `ssh pace` fails in a way that looks like Tailscale being broken when it is
+   working perfectly. Add it to `~/.ssh/config` once and forget it:
+
+   ```
+   Host pace
+       User ec2-user
+   ```
 
 There is no door to close — the security group never had an inbound rule. If you
 followed `setup-aws.md`, you now have three independent ways onto the box: Tailscale
@@ -207,13 +246,13 @@ docker push ghcr.io/<user>/pace:latest
 On the server:
 
 ```bash
-cd /srv/pace && docker compose pull && docker compose up -d
+cd /srv/pace && sudo docker compose pull && sudo docker compose up -d
 ```
 
 No registry, no account, same result:
 
 ```bash
-docker save pace:latest | gzip | ssh pace 'gunzip | docker load'
+docker save pace:latest | gzip | ssh ec2-user@pace 'gunzip | sudo docker load'
 ```
 
 Worth wrapping in a `make deploy` target the first time you do it twice.
@@ -226,12 +265,12 @@ Worth wrapping in a `make deploy` target the first time you do it twice.
 - [ ] MagicDNS and HTTPS certificates enabled in the admin console
 - [ ] Auth key generated: not reusable, not ephemeral
 - [ ] Instance is arm64 (or the exception is written down)
-- [ ] Docker installed, user in the `docker` group
+- [ ] Docker installed **and `docker compose version` works** (the plugin is separate)
 - [ ] `tailscale up --ssh` done, node named `pace`
 - [ ] **Key expiry disabled on the `pace` node**
 - [ ] Container published to `127.0.0.1` only
 - [ ] `tailscale serve` running, URL loads on the laptop
-- [ ] `ssh pace` works over Tailscale SSH
+- [ ] `ssh ec2-user@pace` works over Tailscale SSH
 - [ ] Security group still has zero inbound rules
 - [ ] **Phone loads the URL** (wifi is fine; cellular is an optional extra check)
 - [ ] `tailscale funnel` is not running anywhere

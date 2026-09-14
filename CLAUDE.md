@@ -5,7 +5,8 @@ unit, and an append-only log of what was actually done). Single user, two browse
 
 - [`docs/decisions.md`](docs/decisions.md) — architecture, data model, v1 scope, and
   the rejected alternatives. **Read before proposing any architectural change.**
-- [`docs/setup-server.md`](docs/setup-server.md) — EC2 + Docker + Tailscale runbook.
+- [`docs/setup-aws.md`](docs/setup-aws.md) — AWS account, IAM, and instance launch.
+- [`docs/setup-server.md`](docs/setup-server.md) — Docker + Tailscale runbook.
 
 Module: `github.com/AbdelrahmanAmr2205/pace` · Go 1.26
 

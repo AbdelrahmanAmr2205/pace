@@ -48,7 +48,9 @@ clients, so there is exactly one copy of the data and no synchronisation layer a
 
 - [`docs/decisions.md`](docs/decisions.md) — what was decided, what was rejected, and
   why. Read this before changing the architecture.
-- [`docs/setup-server.md`](docs/setup-server.md) — EC2 + Docker + Tailscale runbook.
+- [`docs/setup-aws.md`](docs/setup-aws.md) — AWS account from scratch: root hardening,
+  budgets, least-privilege identities, and launching the instance with no open ports.
+- [`docs/setup-server.md`](docs/setup-server.md) — Docker + Tailscale runbook.
 
 ## Roadmap
 

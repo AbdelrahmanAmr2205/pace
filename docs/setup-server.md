@@ -6,6 +6,10 @@ No application code involved. This is step 0 of the build order.
 
 Rationale for these choices is in [`decisions.md`](decisions.md) §3 and §6.
 
+**Do [`setup-aws.md`](setup-aws.md) first.** It covers the account itself — root
+hardening, budgets, the identity you log in as, and launching the instance with no
+inbound ports. This document picks up once you have a shell on the box.
+
 ---
 
 ## 1. What Tailscale actually is
@@ -59,16 +63,24 @@ In the Tailscale admin console (login with a personal identity — GitHub/Google
 
 ## 3. EC2 instance
 
-- **Architecture: arm64 (`t4g` / Graviton) if the free tier allows it.** Oracle's
-  Always Free tier is ARM, so matching now makes the later migration a copy rather
-  than a rebuild. If the free tier only offers x86, take it — it is one word in the
-  build command — but note it in the migration plan.
-- Size: the smallest thing available. This app idles at a few MB of RAM.
-- Storage: default is plenty. Remember the DB lives on this disk; snapshots are not a
-  backup strategy on their own.
-- **Security group inbound: SSH from your IP only, temporarily.** This is break-glass
-  access while setting Tailscale up. Do not remove it until §6.
+Covered in full by [`setup-aws.md`](setup-aws.md) §8. The summary:
+
+- **arm64 (`t4g` / Graviton) if the free tier allows it.** Oracle's Always Free tier is
+  ARM, so matching now makes the later migration a copy rather than a rebuild. If only
+  x86 is free, take it — it is one word in the build command — but note it in the
+  migration plan.
+- Smallest available size. This app idles at a few MB of RAM.
+- Storage: 20–30 GiB is plenty. Remember the DB lives on this disk; snapshots are not
+  a backup strategy on their own.
+- **Security group inbound: zero rules.** Not "SSH from my IP, temporarily". Break-glass
+  during setup is Session Manager, which needs no open port — so there is nothing to
+  open and nothing to remember to close. Rules can be added in seconds if you ever
+  need one.
+- An instance role granting `AmazonSSMManagedInstanceCore` and nothing else, and an
+  IMDS hop limit of 1 so containers cannot reach the instance credentials.
 - Outbound: allow all.
+
+You should reach a shell through EC2 → Connect → Session Manager before continuing.
 
 ---
 
@@ -150,14 +162,16 @@ The CLI for `serve` has changed shape across releases — if that form is reject
 certificate, so the browser sees a proper secure origin and the app never has to know
 about certificates at all.
 
-**Now close the door:**
+**Now switch to your permanent way in:**
 
 1. Install Tailscale on the laptop, log in with the same identity.
 2. Confirm `ssh pace` works over Tailscale SSH.
-3. Only then remove the port 22 rule from the security group.
 
-Keep EC2 Instance Connect or Session Manager available as a fallback. Locking yourself
-out of a cloud VM is an easy own-goal and the whole point of doing this in order.
+There is no door to close — the security group never had an inbound rule. If you
+followed `setup-aws.md`, you now have three independent ways onto the box: Tailscale
+SSH (daily), Session Manager (when Tailscale is unhappy), and the `pace` key pair plus
+a temporary firewall rule (when both are). Locking yourself out of a cloud VM is an
+easy own-goal; the layering is deliberate.
 
 ---
 
@@ -208,6 +222,7 @@ Worth wrapping in a `make deploy` target the first time you do it twice.
 
 ## 9. Checklist
 
+- [ ] [`setup-aws.md`](setup-aws.md) checklist complete
 - [ ] MagicDNS and HTTPS certificates enabled in the admin console
 - [ ] Auth key generated: not reusable, not ephemeral
 - [ ] Instance is arm64 (or the exception is written down)
@@ -216,6 +231,7 @@ Worth wrapping in a `make deploy` target the first time you do it twice.
 - [ ] **Key expiry disabled on the `pace` node**
 - [ ] Container published to `127.0.0.1` only
 - [ ] `tailscale serve` running, URL loads on the laptop
-- [ ] `ssh pace` works over Tailscale, *then* port 22 removed from the security group
+- [ ] `ssh pace` works over Tailscale SSH
+- [ ] Security group still has zero inbound rules
 - [ ] **Phone loads the URL** (wifi is fine; cellular is an optional extra check)
 - [ ] `tailscale funnel` is not running anywhere
